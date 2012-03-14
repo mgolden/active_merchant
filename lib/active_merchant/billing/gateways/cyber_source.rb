@@ -2,10 +2,19 @@ module ActiveMerchant #:nodoc:
   module Billing #:nodoc:
     # See the remote and mocked unit test files for example usage.  Pay special attention to the contents of the options hash.
     #
-    # Initial setup instructions can be found in http://cybersource.com/support_center/implementation/downloads/soap_api/SOAP_toolkits.pdf
+    # Initial setup instructions can be found at:
+    # http://cybersource.com/support_center/implementation/downloads/soap_api/SOAP_toolkits.pdf
+    # The API documentation is here:
+    # http://apps.cybersource.com/library/documentation/dev_guides/CC_Svcs_SO_API/html/
+    # Notes on the values of these fields can be found in Appendix A, which is at:
+    # http://apps.cybersource.com/library/documentation/dev_guides/CC_Svcs_SO_API/html/app_fields_so.htm
+    # Note that the order of the fields in some cases is important, as can be seen from the xsd, wsdl here
+    # https://ics2ws.ic3.com/commerce/1.x/transactionProcessor/
+    # 
     # 
     # Debugging 
-    # If you experience an issue with this gateway be sure to examine the transaction information from a general transaction search inside the CyberSource Business
+    # If you experience an issue with this gateway be sure to examine the transaction information
+    # from a general transaction search inside the CyberSource Business
     # Center for the full error messages including field names.   
     #
     # Important Notes
@@ -17,10 +26,22 @@ module ActiveMerchant #:nodoc:
     class CyberSourceGateway < Gateway
       TEST_URL = 'https://ics2wstest.ic3.com/commerce/1.x/transactionProcessor'
       LIVE_URL = 'https://ics2ws.ic3.com/commerce/1.x/transactionProcessor'
-          
-      # visa, master, american_express, discover
-      self.supported_cardtypes = [:visa, :master, :american_express, :discover]
-      self.supported_countries = ['US']
+
+      # card configurations
+      self.supported_cardtypes = [
+        :visa,
+        :master,
+        :american_express,
+        :discover,
+        :diners_club,
+        :jcb,
+        :switch,
+        :solo,
+        :dankort,
+        :maestro,
+        :laser
+      ]
+      self.supported_countries = [] # This gateway supports many countries and currencies
       self.default_currency = 'USD'
       self.homepage_url = 'http://www.cybersource.com'
       self.display_name = 'CyberSource'
@@ -30,7 +51,14 @@ module ActiveMerchant #:nodoc:
         :visa  => '001',
         :master => '002',
         :american_express => '003',
-        :discover => '004'
+        :discover => '004',
+        :diners_club => '005',
+        :jcb => '007',
+        :switch => '024',
+        :solo => '024',
+        :dankort => '034',
+        :maestro => '042',
+        :laser => '035'
       } 
 
       # map response codes to something humans can read
@@ -171,7 +199,19 @@ module ActiveMerchant #:nodoc:
         commit(build_tax_calculation_request(creditcard, options), options)	  
       end
       
-      private                       
+      private
+
+      def cyber_source_shipping_method?(s)
+        ["sameday","oneday","twoday","threeday","lowcost","pickup","other","none"].include?(s)
+      end
+  
+      def split_name(name)
+        return ["",""] if name.blank?
+        names = name.split(" ")
+        last_name = names.pop
+        [names.join(" "), last_name]
+      end
+      
       # Create all address hash key value pairs so that we still function if we were only provided with one or two of them 
       def setup_address_hash(options)
         options[:billing_address] = options[:billing_address] || options[:address] || {}
@@ -180,11 +220,19 @@ module ActiveMerchant #:nodoc:
       
       def build_auth_request(money, creditcard, options)
         xml = Builder::XmlMarkup.new :indent => 2
-        add_address(xml, creditcard, options[:billing_address], options)
+        add_address(xml, creditcard, options[:billing_address], options, false)
+        if options[:shipping_address].is_a?(Hash) && !options[:shipping_address][:address1].blank?
+          add_address(xml, creditcard, options[:shipping_address], options, true)
+        end
+        if options[:line_items].is_a?(Array) && options[:line_items].length>0
+          add_line_item_data(xml, options)
+        end
         add_purchase_data(xml, money, true, options)
         add_creditcard(xml, creditcard)
+        add_merchant_defined_data(xml, options)
         add_auth_service(xml)
         add_business_rules_data(xml)
+        add_device_fingerprint(xml, options)
         xml.target!
       end
 
@@ -249,6 +297,11 @@ module ActiveMerchant #:nodoc:
         xml.target!
       end
 
+      def add_device_fingerprint(xml, options)
+        xml.tag! 'deviceFingerprintID', 
+          options[:device_fingerprint_id] if !options[:device_fingerprint_id].blank?
+      end
+
       def add_business_rules_data(xml)
         xml.tag! 'businessRules' do
           xml.tag!('ignoreAVSResult', 'true') if @options[:ignore_avs]
@@ -283,17 +336,42 @@ module ActiveMerchant #:nodoc:
         end
       end
 
-      def add_address(xml, creditcard, address, options, shipTo = false)      
+      def add_address(xml, creditcard, address, options, shipTo = false)
+        # A small issue exists here that in that CyberSource wants the
+        # name split into first and last name parts.  However, our ActiveMerchant
+        # address has them combined.  If there are more than two names, we don't
+        # know which way to split them.  We can gain a hint if the name matches
+        # the first_name, last_name split on the credit card.
+        cc_name = "#{creditcard.first_name} #{creditcard.last_name}"
+        if cc_name == address[:name]
+          first_name = creditcard.first_name
+          last_name = creditcard.last_name
+        else
+          first_name, last_name = split_name(address[:name])
+        end
         xml.tag! shipTo ? 'shipTo' : 'billTo' do
-          xml.tag! 'firstName', creditcard.first_name
-          xml.tag! 'lastName', creditcard.last_name 
+          xml.tag! 'firstName', first_name
+          xml.tag! 'lastName', last_name 
           xml.tag! 'street1', address[:address1]
           xml.tag! 'street2', address[:address2]
           xml.tag! 'city', address[:city]
           xml.tag! 'state', address[:state]
           xml.tag! 'postalCode', address[:zip]
           xml.tag! 'country', address[:country]
-          xml.tag! 'email', options[:email]
+          xml.tag! 'phoneNumber', address[:phone] if !address[:phone].blank?
+          if shipTo
+            csm = options[:cyber_source_shipping_method].to_s
+            xml.tag! 'shippingMethod', csm if cyber_source_shipping_method?(csm)
+          else
+            # add e-mail if present
+            xml.tag! 'email', options[:email] if ! options[:email].blank?
+            # Customer’s IP address. 
+            xml.tag! 'ipAddress', options[:ip_address] if ! options[:ip_address].blank?
+            # DNS resolved hostname from ipAddress.
+            xml.tag! 'hostname', options[:hostname] if ! options[:hostname].blank?
+            # Customer’s browser as identified from the HTTP header data.
+            xml.tag! 'httpBrowserType', options[:http_browser_type] if ! options[:http_browser_type].blank?
+          end
         end 
       end
 
@@ -304,6 +382,18 @@ module ActiveMerchant #:nodoc:
           xml.tag! 'expirationYear', format(creditcard.year, :four_digits)
           xml.tag!('cvNumber', creditcard.verification_value) unless (@options[:ignore_cvv] || creditcard.verification_value.blank? )
           xml.tag! 'cardType', @@credit_card_codes[card_brand(creditcard).to_sym]
+        end
+      end
+
+      def add_merchant_defined_data(xml, options)
+        mdd = options[:merchant_defined_data]
+        return if ! mdd.is_a?(Hash)
+        xml.tag! 'merchantDefinedData' do
+          (1..20).each do |i|
+            f = "field#{i}"
+            v = mdd[f.to_sym]
+            xml.tag! f, v if ! v.blank?
+          end
         end
       end
 
@@ -366,7 +456,8 @@ module ActiveMerchant #:nodoc:
               end
             end
             xml.tag! 's:Body', {'xmlns:xsi' => 'http://www.w3.org/2001/XMLSchema-instance', 'xmlns:xsd' => 'http://www.w3.org/2001/XMLSchema'} do
-              xml.tag! 'requestMessage', {'xmlns' => 'urn:schemas-cybersource-com:transaction-data-1.32'} do
+              # The CyberSource API version number is here - it should be kept up to date
+              xml.tag! 'requestMessage', {'xmlns' => 'urn:schemas-cybersource-com:transaction-data-1.68'} do
                 add_merchant_data(xml, options)
                 xml << body
               end

@@ -15,6 +15,9 @@ require 'rake/gempackagetask'
 require 'support/gateway_support'
 require 'support/outbound_hosts'
 
+require 'active_merchant/version'
+VERSION = ActiveMerchant::VERSION
+
 desc "Run the unit test suite"
 task :default => 'test:units'
 
